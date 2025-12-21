@@ -1,136 +1,96 @@
 
-#!/usr/bin/env bash
-set -euo pipefail
+#Requires -Modules Az.Accounts, Az.Resources, Az.RecoveryServices, Az.Compute, Az.Network, Az.SiteRecovery
+param(
+  [string]$PrimaryRg      = "asr-demo-primary-rg",
+  [string]$PrimaryLocation= "Central India",
+  [string]$SecondaryRg    = "asr-demo-secondary-rg",
+  [string]$SecondaryLocation = "South India",
+  [string]$VaultName      = "asr-demo-rsvault-{0}" -f ([int][double]::Parse((Get-Date).ToFileTimeUtc()))
+)
 
-# ============
-# CONFIGURATION
-# ============
-PRIMARY_RG="asr-demo-primary-rg"
-PRIMARY_LOCATION="Central India"      # change if needed
-SECONDARY_RG="asr-demo-secondary-rg"
-SECONDARY_LOCATION="South India"      # change if needed
-VAULT_NAME="asr-demo-rsvault-$(date +%s)"
-REPL_POLICY_NAME="asr-demo-policy"
-RECOVERY_PLAN_NAME="asr-demo-recovery-plan"
+$ErrorActionPreference = "Stop"
 
-# Clone repo (idempotent)
-if [ ! -d "azure-site-recovery-demo" ]; then
+Write-Host "==> Login (if needed)..." -ForegroundColor Cyan
+if (-not (Get-AzContext)) { Connect-AzAccount }
+
+Write-Host "==> Clone repo..." -ForegroundColor Cyan
+if (-not (Test-Path ".\azure-site-recovery-demo")) {
   git clone https://github.com/mattfeltonma/azure-site-recovery-demo.git
-fi
-cd azure-site-recovery-demo
+}
+Set-Location .\azure-site-recovery-demo
 
-echo "==> Creating resource groups..."
-az group create --name "$PRIMARY_RG" --location "$PRIMARY_LOCATION"
-az group create --name "$SECONDARY_RG" --location "$SECONDARY_LOCATION"
+Write-Host "==> Create RGs..." -ForegroundColor Cyan
+New-AzResourceGroup -Name $PrimaryRg   -Location $PrimaryLocation -ErrorAction SilentlyContinue | Out-Null
+New-AzResourceGroup -Name $SecondaryRg -Location $SecondaryLocation -ErrorAction SilentlyContinue | Out-Null
 
-echo "==> Deploying PRIMARY site (ARM template from repo)..."
-az deployment group create \
-  --resource-group "$PRIMARY_RG" \
-  --template-file ./templates/primary.json \
-  --parameters @./parameters/primary.parameters.json
+Write-Host "==> Deploy PRIMARY (ARM)..." -ForegroundColor Cyan
+New-AzResourceGroupDeployment -ResourceGroupName $PrimaryRg `
+  -TemplateFile .\templates\primary.json `
+  -TemplateParameterFile .\parameters\primary.parameters.json
 
-echo "==> Deploying SECONDARY site (ARM template from repo)..."
-az deployment group create \
-  --resource-group "$SECONDARY_RG" \
-  --template-file ./templates/secondary.json \
-  --parameters @./parameters/secondary.parameters.json
+Write-Host "==> Deploy SECONDARY (ARM)..." -ForegroundColor Cyan
+New-AzResourceGroupDeployment -ResourceGroupName $SecondaryRg `
+  -TemplateFile .\templates\secondary.json `
+  -TemplateParameterFile .\parameters\secondary.parameters.json
 
-# Create Recovery Services Vault in PRIMARY region
-echo "==> Creating Recovery Services Vault..."
-az backup vault create \
-  --name "$VAULT_NAME" \
-  --resource-group "$PRIMARY_RG" \
-  --location "$PRIMARY_LOCATION"
+Write-Host "==> Create Recovery Services Vault..." -ForegroundColor Cyan
+New-AzRecoveryServicesVault -Name $VaultName -ResourceGroupName $PrimaryRg -Location $PrimaryLocation | Out-Null
+$vault = Get-AzRecoveryServicesVault -Name $VaultName -ResourceGroupName $PrimaryRg
+Set-AzRecoveryServicesVaultContext -Vault $vault
+# Set storage model to GRS
+$vault.Properties.storageModelType = "GeoRedundant"
+$vault | Set-AzRecoveryServicesVault
 
-# Enable Site Recovery provider features on the vault
-# (storageModeType GRS recommended for DR; see docs)
-echo "==> Configuring Vault settings (GRS storage for Site Recovery/Backup)..."
-az resource update \
-  --ids "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$PRIMARY_RG/providers/Microsoft.RecoveryServices/vaults/$VAULT_NAME" \
-  --set properties.storageModelType="GeoRedundant"
+Write-Host "==> Create replication policy..." -ForegroundColor Cyan
+$policy = New-AzRecoveryServicesAsrPolicy -Name "asr-demo-policy" `
+  -ReplicationProvider "A2A" `
+  -RecoveryPointHistory 8 `
+  -ApplicationConsistentSnapshotFrequencyInHours 1
 
-# Create a replication policy (values per demo; adjust per your RPO/RTO)
-# Refer to ASR /vault policies concepts. [2](https://learn.microsoft.com/en-us/azure/site-recovery/)
-echo "==> Creating Site Recovery replication policy..."
-az site-recovery replication-policy create \
-  --name "$REPL_POLICY_NAME" \
-  --resource-group "$PRIMARY_RG" \
-  --vault-name "$VAULT_NAME" \
-  --recovery-point-history 8 \
-  --app-consistent-snapshot-frequency 60
+Write-Host "==> Discover demo VMs..." -ForegroundColor Cyan
+$vms = Get-AzVM -ResourceGroupName $PrimaryRg
 
-# Discover the demo VMs in the PRIMARY RG
-echo "==> Discovering demo VMs for replication..."
-VM_IDS=$(az vm list -g "$PRIMARY_RG" --query "[].id" -o tsv)
+# Create/resolve fabric & protection container (Azure-to-Azure)
+$fabric = Get-AzRecoveryServicesAsrFabric -Name "primary-fabric" -ErrorAction SilentlyContinue
+if (-not $fabric) {
+  $job = New-AzRecoveryServicesAsrFabric -Name "primary-fabric" -Location $PrimaryLocation -Type "Azure"
+  $job | Wait-AzRecoveryServicesAsrJob
+  $fabric = Get-AzRecoveryServicesAsrFabric -Name "primary-fabric"
+}
+$container = Get-AzRecoveryServicesAsrProtectionContainer -Fabric $fabric -ErrorAction SilentlyContinue
+if (-not $container) {
+  $job = New-AzRecoveryServicesAsrProtectionContainer -Name "primary-container" -Fabric $fabric
+  $job | Wait-AzRecoveryServicesAsrJob
+  $container = Get-AzRecoveryServicesAsrProtectionContainer -Fabric $fabric
+}
 
-# Create mappings: vault → fabric → protection container
-# Azure creates a "fabric" per region; we query or create as needed.
-PRIMARY_FABRIC=$(az site-recovery fabric list --vault-name "$VAULT_NAME" --resource-group "$PRIMARY_RG" --query "[?contains(properties.customDetails.instanceType, 'Azure')] | [0].name" -o tsv || true)
-if [ -z "$PRIMARY_FABRIC" ]; then
-  echo "==> Creating fabric for PRIMARY region..."
-  az site-recovery fabric create \
-    --resource-group "$PRIMARY_RG" \
-    --vault-name "$VAULT_NAME" \
-    --name "primary-fabric" \
-    --location "$PRIMARY_LOCATION"
-  PRIMARY_FABRIC="primary-fabric"
-fi
+Write-Host "==> Enable replication for each VM..." -ForegroundColor Cyan
+$secondaryVnet = Get-AzVirtualNetwork -Name "secondary-vnet" -ResourceGroupName $SecondaryRg -ErrorAction SilentlyContinue
+$secondarySubnet = $secondaryVnet.Subnets | Where-Object {$_.Name -eq "default"}
 
-PRIMARY_CONTAINER=$(az site-recovery protection-container list --vault-name "$VAULT_NAME" --resource-group "$PRIMARY_RG" --fabric-name "$PRIMARY_FABRIC" --query "[0].name" -o tsv || true)
-if [ -z "$PRIMARY_CONTAINER" ]; then
-  echo "==> Creating protection container..."
-  az site-recovery protection-container create \
-    --resource-group "$PRIMARY_RG" \
-    --vault-name "$VAULT_NAME" \
-    --fabric-name "$PRIMARY_FABRIC" \
-    --name "primary-container"
-  PRIMARY_CONTAINER="primary-container"
-fi
+foreach ($vm in $vms) {
+  $protectable = New-AzRecoveryServicesAsrProtectableItem -ProtectionContainer $container -AzureVMId $vm.Id
+  $job = New-AzRecoveryServicesAsrReplicationProtectedItem `
+    -ProtectableItem $protectable `
+    -Policy $policy `
+    -RecoveryResourceGroupId (Get-AzResourceGroup -Name $SecondaryRg).ResourceId `
+    -RecoveryAzureNetworkId $secondaryVnet.Id `
+    -RecoveryAzureSubnetName $secondarySubnet.Name
+  $job | Wait-AzRecoveryServicesAsrJob
+}
 
-# Enable replication for each VM to SECONDARY region/network created by the repo
-# (Network mapping leverages the VNet objects provisioned by templates.)
-# ASR enable requires target RG, VNet/Subnet in secondary; adjust names if needed.
-echo "==> Enabling replication for VMs..."
-for VMID in $VM_IDS; do
-  VMNAME=$(basename "$VMID")
-  az site-recovery replication-protected-item create \
-    --resource-group "$PRIMARY_RG" \
-    --vault-name "$VAULT_NAME" \
-    --fabric-name "$PRIMARY_FABRIC" \
-    --protection-container-name "$PRIMARY_CONTAINER" \
-    --name "rpi-$VMNAME" \
-    --policy-name "$REPL_POLICY_NAME" \
-    --protectable-item-id "$VMID" \
-    --recovery-resource-group-id "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/$SECONDARY_RG" \
-    --recovery-azure-network-id "$(az network vnet show -g "$SECONDARY_RG" -n secondary-vnet --query id -o tsv 2>/dev/null || true)" \
-    --target-azure-subnet "$(az network vnet subnet show -g "$SECONDARY_RG" --vnet-name secondary-vnet -n default --query id -o tsv 2>/dev/null || true)"
-done
+Write-Host "==> Create Recovery Plan..." -ForegroundColor Cyan
+$rpis = Get-AzRecoveryServicesAsrReplicationProtectedItem
+$job = New-AzRecoveryServicesAsrRecoveryPlan -Name "asr-demo-recovery-plan" `
+  -PrimaryFabric $fabric `
+  -RecoveryFabric $fabric `
+  -ReplicationProtectedItem $rpis `
+  -FailoverDirection "PrimaryToSecondary"
+$job | Wait-AzRecoveryServicesAsrJob
 
-# Create a Recovery Plan (group the protected items)
-echo "==> Creating Recovery Plan..."
-# Collect protected item IDs
-RPI_IDS=$(az site-recovery replication-protected-item list \
-  --resource-group "$PRIMARY_RG" \
-  --vault-name "$VAULT_NAME" \
-  --fabric-name "$PRIMARY_FABRIC" \
-  --protection-container-name "$PRIMARY_CONTAINER" \
-  --query "[].id" -o tsv)
+Write-Host "==> Test Failover..." -ForegroundColor Cyan
+$job = Start-AzRecoveryServicesAsrTestFailoverJob -RecoveryPlanName "asr-demo-recovery-plan" -FailoverDirection "PrimaryToSecondary" `
+  -TestNetworkId (Get-AzVirtualNetwork -ResourceGroupName $SecondaryRg -Name "testfailover-vnet").Id
+$job | Wait-AzRecoveryServicesAsrJob
 
-az site-recovery recovery-plan create \
-  --name "$RECOVERY_PLAN_NAME" \
-  --resource-group "$PRIMARY_RG" \
-  --vault-name "$VAULT_NAME" \
-  --failover-direction PrimaryToSecondary \
-  --protected-items "$RPI_IDS"
-
-# Kick off a Test Failover (non-disruptive bubble network by default)
-# See Site Recovery test failover guidance. [2](https://learn.microsoft.com/en-us/azure/site-recovery/)
-echo "==> Initiating TEST FAILOVER..."
-az site-recovery recovery-plan test-failover \
-  --name "$RECOVERY_PLAN_NAME" \
-  --resource-group "$PRIMARY_RG" \
-  --vault-name "$VAULT_NAME" \
-  --failover-direction PrimaryToSecondary \
-  --test-vnet "$(az network vnet show -g "$SECONDARY_RG" -n testfailover-vnet --query id -o tsv 2>/dev/null || true)"
-
-echo "==> All steps submitted. Monitor job progress in the Recovery Services Vault (Portal) under Site Recovery Jobs."
+Write-Host "==> Completed: monitor jobs & VMs in Recovery Services Vault (Portal) under Site Recovery." -ForegroundColor Green
